@@ -1,16 +1,13 @@
 import os
 import time
 import json
-from google.cloud import pubsub_v1
-from torch.utils.tensorboard import SummaryWriter
 import torch
 import torch.nn as nn
 from transformers import BertTokenizer
+from kafka import KafkaProducer
 
-# Constantes para parametrizações de configuração no PubSub
-PROJECT = "SIMPLE_TRANSFORMER_GCP_PROJECT"  # TODO os.environ["GCP_PROJECT"]
-TOPIC = "SIMPLE_TRANSFORMER_TRAINING_PUBSUB_TOPIC"  # TODO os.environ["TRAINING_PUBSUB_TOPIC"]
-JOB_ID = "SIMPLE_TRANSFORMER_JOB"  # TODO os.environ.get("JOB_ID", "job-unknown")
+# Constantes para parametrizações de configuração no PubSub usando Apache Kafka
+TOPIC = "SIMPLE_TRANSFORMER_TOPIC"
 
 # Constantes para parametrizações do modelo Transformer Simples
 VOCAB_SIZE = 30522  # Usando o vocabulário do BERT
@@ -73,26 +70,20 @@ class SimpleTransformerTrainer():
         # Inicializando o tokenizador
         self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
 
+        # Inicializando o otimizador
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=0.001)
+        self.criterion = nn.CrossEntropyLoss()
+
     def tokenize(self):
         # Tokenizando o texto
         inputs = self.tokenizer(self.text_sentence_train, self.text_sentence_train_b, return_tensors='pt')
         self.input_ids = inputs['input_ids']  # IDs dos tokens
-
-        # Apenas para uso da renderização dos pesos e tokens de atenção no BertViz
-        # ------------------------------------------------------------------------
-        # input_id_list = input_ids[0].tolist()
-        # token_type_ids = inputs['token_type_ids']
-        # tokens = self.tokenizer.convert_ids_to_tokens(input_id_list)
-        # sentence_b_start = token_type_ids[0].tolist().index(1)
-
-        # Definindo a função de perda e o otimizador
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=0.001)
-        self.criterion = nn.CrossEntropyLoss()
         
     def train(self):
         self.model.train()
         self.optimizer.zero_grad()
         
+        self.tokenize()
         output, attention_weights = self.model(self.input_ids)  # Passa os dados pelo modelo
 
         output = output.transpose(0, 1)  # Reverter a transposição
@@ -105,24 +96,19 @@ class SimpleTransformerTrainer():
         return loss.item(), attention_weights
     
 class PubSubPublisherClient():
-    def __init__(self, job_id, project, topic):
-        super(SimpleTransformerTrainerManager, self).__init__()
+    def __init__(self, topic):
+        super(PubSubPublisherClient, self).__init__()
 
-        # Definindo configurações para conexão com o pubsub client
-        self.job_id = job_id
-        self.project = project
+        # Definindo configurações para conexão com o pubsub client usando Apache Kafka
         self.topic = topic
         
-        self.pubsub_publisher_client = pubsub_v1.PublisherClient()
-        self.topic_path = self.pubsub_publisher_client.topic_path(project, topic)
-
-        # Tensorboard
-        self.tb_logdir = os.environ.get("AIP_TENSORBOARD_LOG_DIR", "/tmp/tb")
-        self.writer = SummaryWriter(self.tb_logdir)
+        self.producer = KafkaProducer(
+            bootstrap_servers=["localhost:9092"], # endereço do broker Kafka
+            value_serializer=lambda v: json.dumps(v).encode("utf-8") # serialização em JSON
+        )
 
     def build_payload(self, step, key_values):
         payload = {
-            "job_id": self.job_id,
             "step": step,
             "timestamp": time.time()
         }
@@ -132,14 +118,8 @@ class PubSubPublisherClient():
 
         return payload
 
-    def add_scalar(self, key, value, step):
-        self.writer.add_scalar(key, value, step)
-
     def publish_update(self, payload):
-        self.pubsub_publisher_client.publish(self.topic_path, json.dumps(payload).encode("utf-8"))
-
-    def close(self):
-        self.writer.close()
+        self.producer.send(self.topic, payload)
 
 # Definindo classe para operações de treinamento conforme o Nº de iterações parametrizado pelo algoritmo, e comunicação com PubSub
 class SimpleTransformerTrainerManager():
@@ -152,24 +132,19 @@ class SimpleTransformerTrainerManager():
         self.num_publisher_blocks = num_publisher_blocks
 
     def train(self):
-        for step in self.num_steps:
+        for step in range(1, self.num_steps+1):
             loss, attention_weights = self.trainer.train()
-            
-            self.publisher.add_scalar("loss", loss, step)
-            self.publisher.add_scalar("attention_weights", attention_weights, step)
 
             if step % self.num_publisher_blocks == 0:
                 key_values_payload = {
                     "loss": loss,
-                    "attention_weights": attention_weights
+                    "attention_weights": attention_weights.tolist()
                 }
-                payload = self,publisher.build_payload(step, key_values_payload)
+                payload = self.publisher.build_payload(step, key_values_payload)
 
                 self.publisher.publish_update(payload)
 
             time.sleep(0.1)
-
-        self.publisher.close()
 
 if __name__ == "__main__":
     model = SimpleTransformerModel(VOCAB_SIZE, EMBED_SIZE, NUM_HEADS)
@@ -178,7 +153,6 @@ if __name__ == "__main__":
     text_sentence_b = "teste comparativo da outra sentenca"
     
     trainer = SimpleTransformerTrainer(model, text_sentence_train, text_sentence_b)
-    publisher = PubSubPublisherClient(JOB_ID, PROJECT, TOPIC)
-    trainer_manager = SimpleTransformerTrainerManager(trainer, publisher, NUM_STEPS, NUM_PUBLISHER_BLOCKS
-                                                      )
+    publisher = PubSubPublisherClient(TOPIC)
+    trainer_manager = SimpleTransformerTrainerManager(trainer, publisher, NUM_STEPS, NUM_PUBLISHER_BLOCKS)
     trainer_manager.train()
